@@ -28,6 +28,8 @@ class Category:
     id: int
     name: str
     kind: str = "both"
+    color: str | None = None
+    icon: str | None = None
 
 
 class CategoryRepository:
@@ -45,22 +47,32 @@ class CategoryRepository:
             )
 
     def list_all(self) -> list[Category]:
-        rows = self.conn.execute("SELECT id, name, kind FROM categories ORDER BY name;").fetchall()
-        return [Category(id=r["id"], name=r["name"], kind=r["kind"]) for r in rows]
+        rows = self.conn.execute(
+            "SELECT id, name, kind, color, icon FROM categories ORDER BY name;"
+        ).fetchall()
+        return [
+            Category(id=r["id"], name=r["name"], kind=r["kind"],
+                     color=r["color"], icon=r["icon"])
+            for r in rows
+        ]
 
-    def create(self, *, name: str, kind: str = "both") -> int:
+    def create(self, *, name: str, kind: str = "both",
+               color: str | None = None, icon: str | None = None) -> int:
         now = _now_iso()
         cur = self.conn.execute(
-            "INSERT INTO categories(name, kind, created_at, updated_at) VALUES (?, ?, ?, ?);",
-            (name, kind, now, now),
+            "INSERT INTO categories(name, kind, color, icon, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?);",
+            (name, kind, color, icon, now, now),
         )
-        return int(cur.lastrowid)
+        assert cur.lastrowid is not None
+        return cur.lastrowid
 
-    def update(self, *, category_id: int, name: str, kind: str = "both") -> None:
+    def update(self, *, category_id: int, name: str, kind: str = "both",
+               color: str | None = None, icon: str | None = None) -> None:
         now = _now_iso()
         self.conn.execute(
-            "UPDATE categories SET name=?, kind=?, updated_at=? WHERE id=?;",
-            (name, kind, now, int(category_id)),
+            "UPDATE categories SET name=?, kind=?, color=?, icon=?, updated_at=? WHERE id=?;",
+            (name, kind, color, icon, now, int(category_id)),
         )
 
     def delete(self, *, category_id: int) -> None:
@@ -94,7 +106,8 @@ class TransactionRepository:
                 now,
             ),
         )
-        return int(cur.lastrowid)
+        assert cur.lastrowid is not None
+        return cur.lastrowid
 
     def list_between(
         self,
@@ -143,6 +156,23 @@ class TransactionRepository:
             out.append(StoredTransaction(id=int(r["id"]), transaction=tx))
         return out
 
+    def list_all(self) -> list[StoredTransaction]:
+        rows = self.conn.execute(
+            "SELECT id, type, amount_cents, occurred_at, category_id, note "
+            "FROM transactions ORDER BY occurred_at ASC, id ASC;"
+        ).fetchall()
+        out: list[StoredTransaction] = []
+        for r in rows:
+            tx = Transaction(
+                type=TransactionType(r["type"]),
+                amount_cents=int(r["amount_cents"]),
+                occurred_at=_dt_from_iso(r["occurred_at"]),
+                category_id=r["category_id"],
+                note=r["note"],
+            )
+            out.append(StoredTransaction(id=int(r["id"]), transaction=tx))
+        return out
+
     def delete(self, *, tx_id: int) -> None:
         self.conn.execute("DELETE FROM transactions WHERE id=?;", (int(tx_id),))
 
@@ -179,6 +209,8 @@ class Goal:
     current_cents: int
     deadline_at: datetime | None = None
     note: str | None = None
+    icon: str | None = None
+    color: str | None = None
 
     @property
     def progress_ratio(self) -> float:
@@ -194,7 +226,7 @@ class GoalRepository:
     def list_all(self) -> list[Goal]:
         rows = self.conn.execute(
             """
-            SELECT id, name, target_cents, current_cents, deadline_at, note
+            SELECT id, name, target_cents, current_cents, deadline_at, note, icon, color
             FROM goals
             ORDER BY COALESCE(deadline_at, '9999-12-31T00:00:00+00:00') ASC, id DESC;
             """
@@ -207,6 +239,8 @@ class GoalRepository:
                 current_cents=int(r["current_cents"]),
                 deadline_at=_dt_from_iso(r["deadline_at"]) if r["deadline_at"] else None,
                 note=r["note"],
+                icon=r["icon"],
+                color=r["color"],
             )
             for r in rows
         ]
@@ -219,6 +253,8 @@ class GoalRepository:
         current_cents: int = 0,
         deadline_at: datetime | None = None,
         note: str | None = None,
+        icon: str | None = None,
+        color: str | None = None,
     ) -> int:
         if target_cents <= 0:
             raise ValueError("target_cents must be > 0")
@@ -227,20 +263,16 @@ class GoalRepository:
         now = _now_iso()
         cur = self.conn.execute(
             """
-            INSERT INTO goals(name, target_cents, current_cents, deadline_at, note, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?);
+            INSERT INTO goals(name, target_cents, current_cents, deadline_at, note,
+                              icon, color, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
             """,
-            (
-                name,
-                int(target_cents),
-                int(current_cents),
-                _dt_to_iso(deadline_at) if deadline_at else None,
-                note,
-                now,
-                now,
-            ),
+            (name, int(target_cents), int(current_cents),
+             _dt_to_iso(deadline_at) if deadline_at else None,
+             note, icon, color, now, now),
         )
-        return int(cur.lastrowid)
+        assert cur.lastrowid is not None
+        return cur.lastrowid
 
     def update(
         self,
@@ -251,6 +283,8 @@ class GoalRepository:
         current_cents: int,
         deadline_at: datetime | None,
         note: str | None,
+        icon: str | None = None,
+        color: str | None = None,
     ) -> None:
         if target_cents <= 0:
             raise ValueError("target_cents must be > 0")
@@ -260,23 +294,19 @@ class GoalRepository:
         self.conn.execute(
             """
             UPDATE goals
-            SET name=?, target_cents=?, current_cents=?, deadline_at=?, note=?, updated_at=?
+            SET name=?, target_cents=?, current_cents=?, deadline_at=?,
+                note=?, icon=?, color=?, updated_at=?
             WHERE id=?;
             """,
-            (
-                name,
-                int(target_cents),
-                int(current_cents),
-                _dt_to_iso(deadline_at) if deadline_at else None,
-                note,
-                now,
-                int(goal_id),
-            ),
+            (name, int(target_cents), int(current_cents),
+             _dt_to_iso(deadline_at) if deadline_at else None,
+             note, icon, color, now, int(goal_id)),
         )
 
     def get(self, *, goal_id: int) -> Goal | None:
         row = self.conn.execute(
-            "SELECT id, name, target_cents, current_cents, deadline_at, note FROM goals WHERE id=?;",
+            "SELECT id, name, target_cents, current_cents, deadline_at, note, icon, color"
+            " FROM goals WHERE id=?;",
             (int(goal_id),),
         ).fetchone()
         if row is None:
@@ -288,6 +318,8 @@ class GoalRepository:
             current_cents=int(row["current_cents"]),
             deadline_at=_dt_from_iso(row["deadline_at"]) if row["deadline_at"] else None,
             note=row["note"],
+            icon=row["icon"],
+            color=row["color"],
         )
 
     def deposit(self, *, goal_id: int, amount_cents: int) -> Goal:
@@ -324,6 +356,8 @@ class Reminder:
     recurrence: str = "none"  # none|daily|weekly|monthly
     amount_cents: int | None = None
     note: str | None = None
+    icon: str | None = None
+    color: str | None = None
 
 
 def _add_months(dt: datetime, months: int) -> datetime:
@@ -361,7 +395,7 @@ class ReminderRepository:
         cutoff = now + timedelta(days=within_days)
         rows = self.conn.execute(
             """
-            SELECT id, name, amount_cents, due_at, recurrence, note
+            SELECT id, name, amount_cents, due_at, recurrence, note, icon, color
             FROM reminders
             WHERE due_at >= ? AND due_at <= ?
             ORDER BY due_at ASC, id DESC;
@@ -376,6 +410,8 @@ class ReminderRepository:
                 due_at=_dt_from_iso(r["due_at"]),
                 recurrence=str(r["recurrence"]),
                 note=r["note"],
+                icon=r["icon"],
+                color=r["color"],
             )
             for r in rows
         ]
@@ -383,7 +419,7 @@ class ReminderRepository:
     def list_due_sorted(self) -> list[Reminder]:
         rows = self.conn.execute(
             """
-            SELECT id, name, amount_cents, due_at, recurrence, note
+            SELECT id, name, amount_cents, due_at, recurrence, note, icon, color
             FROM reminders
             ORDER BY due_at ASC, id DESC;
             """
@@ -396,6 +432,8 @@ class ReminderRepository:
                 due_at=_dt_from_iso(r["due_at"]),
                 recurrence=str(r["recurrence"]),
                 note=r["note"],
+                icon=r["icon"],
+                color=r["color"],
             )
             for r in rows
         ]
@@ -408,6 +446,8 @@ class ReminderRepository:
         recurrence: str = "none",
         amount_cents: int | None = None,
         note: str | None = None,
+        icon: str | None = None,
+        color: str | None = None,
     ) -> int:
         if not name.strip():
             raise ValueError("name must be non-empty")
@@ -420,12 +460,15 @@ class ReminderRepository:
         now = _now_iso()
         cur = self.conn.execute(
             """
-            INSERT INTO reminders(name, amount_cents, due_at, recurrence, note, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?);
+            INSERT INTO reminders(name, amount_cents, due_at, recurrence, note,
+                                  icon, color, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
             """,
-            (name.strip(), amount_cents, _dt_to_iso(due_at), recurrence, note, now, now),
+            (name.strip(), amount_cents, _dt_to_iso(due_at), recurrence,
+             note, icon, color, now, now),
         )
-        return int(cur.lastrowid)
+        assert cur.lastrowid is not None
+        return cur.lastrowid
 
     def delete(self, *, reminder_id: int) -> None:
         self.conn.execute("DELETE FROM reminders WHERE id=?;", (int(reminder_id),))

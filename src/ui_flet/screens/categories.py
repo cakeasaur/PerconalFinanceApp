@@ -1,15 +1,29 @@
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Callable
-from typing import Any
 
 import flet as ft
 
 from ...infra.db.connection import transaction as db_tx
 from ...infra.db.repositories import Category
-from ..components import build_sidebar, close_dialog, empty_state, open_dialog
+from ...infra.logging import get_logger
+from ..components import (
+    DEFAULT_COLOR,
+    DEFAULT_ICON,
+    close_dialog,
+    color_picker,
+    confirm_dialog,
+    empty_state,
+    icon_picker,
+    open_dialog,
+    resolve_icon,
+    screen_header,
+)
 from ..state import Repos
-from ..theme import GREEN, RED, TEXT_MUTED, page_bgcolor
+from ..theme import GREEN, RED, TEXT_MUTED, page_bgcolor, show_snack
+
+log = get_logger("pfm.ui.categories")
 
 _KIND_LABELS = {"income": "Доход", "expense": "Расход", "both": "Оба"}
 _KIND_COLORS = {"income": "#3B82F6", "expense": RED, "both": TEXT_MUTED}
@@ -32,6 +46,11 @@ def _category_dialog(
     on_saved: Callable[[], None],
     existing: Category | None = None,
 ) -> None:
+    sel = {
+        "icon": existing.icon or DEFAULT_ICON if existing else DEFAULT_ICON,
+        "color": existing.color or DEFAULT_COLOR if existing else DEFAULT_COLOR,
+    }
+
     name_f = ft.TextField(
         label="Название", autofocus=True, border_radius=10,
         value=existing.name if existing else "",
@@ -57,21 +76,43 @@ def _category_dialog(
             kind = kind_dd.value or "both"
             with db_tx(repos.cat.conn):
                 if existing is None:
-                    repos.cat.create(name=name, kind=kind)
+                    repos.cat.create(name=name, kind=kind,
+                                     icon=sel["icon"], color=sel["color"])
                 else:
-                    repos.cat.update(category_id=existing.id, name=name, kind=kind)
+                    repos.cat.update(category_id=existing.id, name=name, kind=kind,
+                                     icon=sel["icon"], color=sel["color"])
             close_dialog(page, dlg)
+            action = "создана" if existing is None else "обновлена"
+            show_snack(page, f"Категория «{name}» {action}")
             on_saved()
-        except Exception as exc:
+        except sqlite3.IntegrityError:
+            err.value = "Категория с таким названием уже существует."
+            page.update()
+        except ValueError as exc:
             err.value = str(exc)
+            page.update()
+        except Exception as exc:
+            log.exception("category save failed")
+            err.value = f"Ошибка: {exc}"
             page.update()
 
     dlg = ft.AlertDialog(
         modal=True,
         title=ft.Text("Новая категория" if existing is None else "Редактировать категорию"),
         content=ft.Container(
-            width=360,
-            content=ft.Column(tight=True, spacing=12, controls=[name_f, kind_dd, err]),
+            width=400,
+            content=ft.Column(
+                tight=True, spacing=14,
+                controls=[
+                    name_f,
+                    kind_dd,
+                    ft.Text("Иконка", size=12, color=TEXT_MUTED),
+                    icon_picker(sel["icon"], lambda v: sel.update({"icon": v})),
+                    ft.Text("Цвет", size=12, color=TEXT_MUTED),
+                    color_picker(sel["color"], lambda v: sel.update({"color": v})),
+                    err,
+                ],
+            ),
         ),
         actions=[
             ft.TextButton("Отмена", on_click=lambda _: close_dialog(page, dlg)),
@@ -89,10 +130,21 @@ def _category_row(
     on_refresh: Callable[[], None],
 ) -> ft.Container:
     def do_delete(_: ft.ControlEvent) -> None:
+        confirm_dialog(
+            page,
+            f"Удалить категорию «{cat.name}»? Операции останутся без категории.",
+            on_confirm=lambda: _do_cat_delete(),
+        )
+
+    def _do_cat_delete() -> None:
         with db_tx(repos.cat.conn):
             repos.cat.delete(category_id=cat.id)
+        show_snack(page, f"Категория «{cat.name}» удалена", color=RED)
         on_refresh()
 
+    icon_val = resolve_icon(cat.icon)
+    _kind_fallback = {"income": "#3B82F6", "expense": RED, "both": "#8B5CF6"}
+    color = cat.color or _kind_fallback.get(cat.kind, "#8B5CF6")
     return ft.Container(
         padding=ft.Padding(0, 10, 0, 10),
         border=ft.Border(
@@ -101,7 +153,12 @@ def _category_row(
         content=ft.Row(
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
             controls=[
-                ft.Icon(ft.Icons.LABEL_OUTLINE, size=18, color=TEXT_MUTED),
+                ft.Container(
+                    width=36, height=36, border_radius=10,
+                    bgcolor=ft.Colors.with_opacity(0.12, color),
+                    alignment=ft.Alignment(0, 0),
+                    content=ft.Icon(icon_val, size=18, color=color),
+                ),
                 ft.Container(width=10),
                 ft.Text(cat.name, expand=True, weight=ft.FontWeight.W_500, size=14),
                 _kind_badge(cat.kind),
@@ -125,21 +182,15 @@ def build_categories(
     repos: Repos,
     navigate: Callable[[str], None],
     rebuild: Callable[[], None],
-    on_theme_toggle: Callable[[Any], None],
 ) -> ft.Control:
     categories = repos.cat.list_all()
 
-    header = ft.Row(
-        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-        controls=[
-            ft.Text("Категории", size=22, weight=ft.FontWeight.W_700),
-            ft.FilledButton(
-                "Новая категория", icon=ft.Icons.ADD,
-                on_click=lambda _: _category_dialog(page, repos, rebuild),
-                style=ft.ButtonStyle(bgcolor=GREEN, color=ft.Colors.WHITE),
-            ),
-        ],
+    add_btn = ft.FilledButton(
+        "Новая категория", icon=ft.Icons.ADD,
+        on_click=lambda _: _category_dialog(page, repos, rebuild),
+        style=ft.ButtonStyle(bgcolor=GREEN, color=ft.Colors.WHITE),
     )
+    header = screen_header(page, "Категории", rebuild, actions=[add_btn])
 
     hint = ft.Text(
         "Категории используются при добавлении операций. "
@@ -149,7 +200,12 @@ def build_categories(
 
     if not categories:
         body: list[ft.Control] = [
-            empty_state("Категорий нет.\nНажмите «Новая категория».", ft.Icons.LABEL_OUTLINE)
+            empty_state(
+                "Категорий нет.",
+                ft.Icons.LABEL_OUTLINE,
+                cta_text="Создать категорию",
+                on_cta=lambda: _category_dialog(page, repos, rebuild),
+            )
         ]
     else:
         body = [
@@ -165,10 +221,4 @@ def build_categories(
         controls=[header, *body],
     )
 
-    return ft.Row(
-        expand=True,
-        controls=[
-            build_sidebar(page, "categories", navigate, on_theme_toggle),
-            ft.Container(content=content, expand=True, padding=24, bgcolor=page_bgcolor(page)),
-        ],
-    )
+    return ft.Container(content=content, expand=True, padding=24, bgcolor=page_bgcolor(page))

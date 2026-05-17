@@ -2,16 +2,28 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Any
 
 import flet as ft
 
 from ...infra.db.connection import transaction as db_tx
 from ...infra.db.repositories import Reminder
-from ...ui.formatting import RECURRENCE_LABELS, RECURRENCE_UI_TO_VALUE, format_rub, parse_money
-from ..components import build_sidebar, close_dialog, empty_state, open_dialog
+from ...infra.logging import get_logger
+from ..components import (
+    DEFAULT_COLOR,
+    DEFAULT_ICON,
+    close_dialog,
+    color_picker,
+    empty_state,
+    icon_picker,
+    open_dialog,
+    resolve_icon,
+    screen_header,
+)
+from ..formatting import RECURRENCE_LABELS, RECURRENCE_UI_TO_VALUE, format_rub, parse_money
 from ..state import Repos
-from ..theme import GREEN, PURPLE, RED, TEXT_MUTED, page_bgcolor
+from ..theme import GREEN, PURPLE, RED, TEXT_MUTED, page_bgcolor, show_snack
+
+log = get_logger("pfm.ui.reminders")
 
 _ORANGE = "#F97316"
 
@@ -21,6 +33,7 @@ def _reminder_dialog(
     repos: Repos,
     on_saved: Callable[[], None],
 ) -> None:
+    sel = {"icon": DEFAULT_ICON, "color": DEFAULT_COLOR}
     name_f = ft.TextField(label="Название", autofocus=True, border_radius=10)
     due_f = ft.TextField(
         label="Дата и время (ГГГГ-ММ-ДД ЧЧ:ММ)",
@@ -57,21 +70,34 @@ def _reminder_dialog(
                 repos.reminder.create(
                     name=name, due_at=due_dt, recurrence=recurrence,
                     amount_cents=amount_cents, note=note,
+                    icon=sel["icon"], color=sel["color"],
                 )
             close_dialog(page, dlg)
             on_saved()
         except ValueError as exc:
             err.value = str(exc)
             page.update()
+        except Exception as exc:
+            log.exception("reminder save failed")
+            err.value = f"Ошибка: {exc}"
+            page.update()
 
     dlg = ft.AlertDialog(
         modal=True,
         title=ft.Text("Новое напоминание"),
         content=ft.Container(
-            width=400,
+            width=420,
             content=ft.Column(
                 tight=True, spacing=12,
-                controls=[name_f, due_f, recurrence_dd, amount_f, note_f, err],
+                scroll=ft.ScrollMode.AUTO,
+                controls=[
+                    name_f, due_f, recurrence_dd, amount_f, note_f,
+                    ft.Text("Иконка", size=12, color=TEXT_MUTED),
+                    icon_picker(sel["icon"], lambda v: sel.update({"icon": v})),
+                    ft.Text("Цвет", size=12, color=TEXT_MUTED),
+                    color_picker(sel["color"], lambda v: sel.update({"color": v})),
+                    err,
+                ],
             ),
         ),
         actions=[
@@ -90,6 +116,8 @@ def _reminder_card(
     now: datetime,
     on_refresh: Callable[[], None],
 ) -> ft.Container:
+    icon = resolve_icon(r.icon)
+    accent = r.color or _ORANGE
     overdue = r.due_at < now
     due_color = RED if overdue else (_ORANGE if (r.due_at - now).days < 3 else TEXT_MUTED)
     due_label = r.due_at.strftime("%d.%m.%Y %H:%M") + (" · Просрочено" if overdue else "")
@@ -103,11 +131,13 @@ def _reminder_card(
     def do_done(_: ft.ControlEvent) -> None:
         with db_tx(repos.reminder.conn):
             repos.reminder.mark_done(reminder_id=r.id)
+        show_snack(page, f"✓ «{r.name}» отмечено выполненным")
         on_refresh()
 
     def do_delete(_: ft.ControlEvent) -> None:
         with db_tx(repos.reminder.conn):
             repos.reminder.delete(reminder_id=r.id)
+        show_snack(page, "Напоминание удалено", color=RED)
         on_refresh()
 
     return ft.Container(
@@ -120,9 +150,9 @@ def _reminder_card(
         content=ft.Row(
             controls=[
                 ft.Container(
-                    bgcolor=ft.Colors.with_opacity(0.1, due_color), border_radius=8,
-                    width=32, height=32, alignment=ft.Alignment.CENTER,
-                    content=ft.Icon(ft.Icons.ALARM, size=18, color=due_color),
+                    bgcolor=ft.Colors.with_opacity(0.12, accent), border_radius=8,
+                    width=36, height=36, alignment=ft.Alignment.CENTER,
+                    content=ft.Icon(icon, size=18, color=accent),
                 ),
                 ft.Column(spacing=2, expand=True, controls=[
                     ft.Row(controls=[
@@ -158,26 +188,24 @@ def build_reminders(
     repos: Repos,
     navigate: Callable[[str], None],
     rebuild: Callable[[], None],
-    on_theme_toggle: Callable[[Any], None],
 ) -> ft.Control:
     reminders = repos.reminder.list_due_sorted()
     now = datetime.now(UTC)
 
-    header = ft.Row(
-        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-        controls=[
-            ft.Text("Напоминания", size=22, weight=ft.FontWeight.W_700),
-            ft.FilledButton(
-                "Добавить", icon=ft.Icons.ADD,
-                on_click=lambda _: _reminder_dialog(page, repos, rebuild),
-                style=ft.ButtonStyle(bgcolor=GREEN, color=ft.Colors.WHITE),
-            ),
-        ],
+    add_btn = ft.FilledButton(
+        "Добавить", icon=ft.Icons.ADD,
+        on_click=lambda _: _reminder_dialog(page, repos, rebuild),
+        style=ft.ButtonStyle(bgcolor=GREEN, color=ft.Colors.WHITE),
     )
+    header = screen_header(page, "Напоминания", rebuild, actions=[add_btn])
 
     body: list[ft.Control] = (
-        [empty_state("Напоминаний пока нет.\nДобавьте дату платежа и при необходимости повтор.",
-                     ft.Icons.ALARM_OFF)]
+        [empty_state(
+            "Напоминаний пока нет.\nДобавьте дату платежа и повтор.",
+            ft.Icons.ALARM_OFF,
+            cta_text="Добавить напоминание",
+            on_cta=lambda: _reminder_dialog(page, repos, rebuild),
+        )]
         if not reminders else
         [_reminder_card(page, repos, r, now, rebuild) for r in reminders]
     )
@@ -187,11 +215,4 @@ def build_reminders(
         controls=[header, *body],
     )
 
-    return ft.Row(
-        expand=True,
-        controls=[
-            build_sidebar(page, "reminders", navigate, on_theme_toggle),
-            ft.Container(content=content, expand=True, padding=24,
-                         bgcolor=page_bgcolor(page)),
-        ],
-    )
+    return ft.Container(content=content, expand=True, padding=24, bgcolor=page_bgcolor(page))

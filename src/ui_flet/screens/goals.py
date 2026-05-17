@@ -2,21 +2,29 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import UTC, date, datetime
-from typing import Any
 
 import flet as ft
 
 from ...infra.db.connection import transaction as db_tx
 from ...infra.db.repositories import Goal
-from ...ui.formatting import format_rub, parse_money
+from ...infra.logging import get_logger
 from ..components import (
-    build_sidebar,
+    DEFAULT_COLOR,
+    DEFAULT_ICON,
     close_dialog,
+    color_picker,
+    confirm_dialog,
     empty_state,
+    icon_picker,
     open_dialog,
+    resolve_icon,
+    screen_header,
 )
+from ..formatting import format_rub, parse_money
 from ..state import Repos
-from ..theme import GREEN, GREEN_SOFT, PURPLE, RED, TEXT_MUTED, page_bgcolor
+from ..theme import GREEN, GREEN_SOFT, PURPLE, RED, TEXT_MUTED, page_bgcolor, show_snack
+
+log = get_logger("pfm.ui.goals")
 
 
 def _goal_dialog(
@@ -25,6 +33,10 @@ def _goal_dialog(
     on_saved: Callable[[], None],
     existing: Goal | None = None,
 ) -> None:
+    sel = {
+        "icon": existing.icon or DEFAULT_ICON if existing else DEFAULT_ICON,
+        "color": existing.color or DEFAULT_COLOR if existing else DEFAULT_COLOR,
+    }
     name_f = ft.TextField(
         label="Название", autofocus=True, border_radius=10,
         value=existing.name if existing else "",
@@ -69,25 +81,42 @@ def _goal_dialog(
                 if existing is None:
                     repos.goal.create(name=name, target_cents=target_cents,
                                       current_cents=current_cents,
-                                      deadline_at=deadline_dt, note=note)
+                                      deadline_at=deadline_dt, note=note,
+                                      icon=sel["icon"], color=sel["color"])
                 else:
                     repos.goal.update(goal_id=existing.id, name=name,
                                       target_cents=target_cents, current_cents=current_cents,
-                                      deadline_at=deadline_dt, note=note)
+                                      deadline_at=deadline_dt, note=note,
+                                      icon=sel["icon"], color=sel["color"])
             close_dialog(page, dlg)
+            action = "создана" if existing is None else "обновлена"
+            show_snack(page, f"Цель «{name}» {action}")
             on_saved()
         except ValueError as exc:
             err.value = str(exc)
+            page.update()
+        except Exception as exc:
+            log.exception("goal save failed")
+            err.value = f"Ошибка: {exc}"
             page.update()
 
     dlg = ft.AlertDialog(
         modal=True,
         title=ft.Text("Новая цель" if existing is None else "Редактировать цель"),
         content=ft.Container(
-            width=400,
-            content=ft.Column(tight=True, spacing=12,
-                               controls=[name_f, target_f, current_f,
-                                         deadline_f, note_f, err]),
+            width=420,
+            content=ft.Column(
+                tight=True, spacing=12,
+                scroll=ft.ScrollMode.AUTO,
+                controls=[
+                    name_f, target_f, current_f, deadline_f, note_f,
+                    ft.Text("Иконка", size=12, color=TEXT_MUTED),
+                    icon_picker(sel["icon"], lambda v: sel.update({"icon": v})),
+                    ft.Text("Цвет", size=12, color=TEXT_MUTED),
+                    color_picker(sel["color"], lambda v: sel.update({"color": v})),
+                    err,
+                ],
+            ),
         ),
         actions=[
             ft.TextButton("Отмена", on_click=lambda _: close_dialog(page, dlg)),
@@ -120,9 +149,18 @@ def _deposit_dialog(
             with db_tx(repos.goal.conn):
                 repos.goal.deposit(goal_id=goal.id, amount_cents=cents)
             close_dialog(page, dlg)
+            new_total = goal.current_cents + cents
+            if new_total >= goal.target_cents:
+                show_snack(page, f"🎉 Цель «{goal.name}» достигнута!", color=PURPLE)
+            else:
+                show_snack(page, f"Пополнено на {format_rub(cents)} ₽")
             on_saved()
         except ValueError as exc:
             err.value = str(exc)
+            page.update()
+        except Exception as exc:
+            log.exception("goal deposit failed")
+            err.value = f"Ошибка: {exc}"
             page.update()
 
     dlg = ft.AlertDialog(
@@ -141,12 +179,17 @@ def _deposit_dialog(
     open_dialog(page, dlg)
 
 
-def _ring_progress(ratio: float, color: str, size: int = 56) -> ft.Stack:
-    pct = ft.Text(
-        f"{int(ratio * 100)}%",
-        size=11, weight=ft.FontWeight.W_700, color=color,
-        text_align=ft.TextAlign.CENTER,
-    )
+def _ring_progress(ratio: float, color: str, size: int = 56,
+                   icon: str | None = None) -> ft.Stack:
+    inner: ft.Control
+    if icon:
+        inner = ft.Icon(icon, size=size // 3, color=color)
+    else:
+        inner = ft.Text(
+            f"{int(ratio * 100)}%",
+            size=11, weight=ft.FontWeight.W_700, color=color,
+            text_align=ft.TextAlign.CENTER,
+        )
     return ft.Stack(
         width=size, height=size,
         controls=[
@@ -158,7 +201,7 @@ def _ring_progress(ratio: float, color: str, size: int = 56) -> ft.Stack:
             ft.Container(
                 width=size, height=size,
                 alignment=ft.Alignment.CENTER,
-                content=pct,
+                content=inner,
             ),
         ],
     )
@@ -172,15 +215,24 @@ def _goal_card(
 ) -> ft.Container:
     ratio = goal.progress_ratio
     is_done = ratio >= 1.0
-    color = GREEN if is_done else PURPLE
+    color = GREEN if is_done else (goal.color or PURPLE)
+    icon = resolve_icon(goal.icon)
     deadline_str = (
         f"до {goal.deadline_at.date().isoformat()}"
         if goal.deadline_at else ""
     )
 
     def do_delete(_: ft.ControlEvent) -> None:
+        confirm_dialog(
+            page,
+            f"Удалить цель «{goal.name}»? Это действие необратимо.",
+            on_confirm=lambda: _do_goal_delete(goal.id),
+        )
+
+    def _do_goal_delete(gid: int) -> None:
         with db_tx(repos.goal.conn):
-            repos.goal.delete(goal_id=goal.id)
+            repos.goal.delete(goal_id=gid)
+        show_snack(page, "Цель удалена", color=RED)
         on_refresh()
 
     bg = "#1E293B" if page.theme_mode == ft.ThemeMode.DARK else "#FFFFFF"
@@ -195,7 +247,7 @@ def _goal_card(
             spacing=20,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
             controls=[
-                _ring_progress(ratio, color),
+                _ring_progress(ratio, color, icon=icon),
                 ft.Column(
                     spacing=4, expand=True,
                     controls=[
@@ -307,28 +359,23 @@ def build_goals(
     repos: Repos,
     navigate: Callable[[str], None],
     rebuild: Callable[[], None],
-    on_theme_toggle: Callable[[Any], None],
 ) -> ft.Control:
     goals = repos.goal.list_all()
 
-    header = ft.Row(
-        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-        controls=[
-            ft.Text("Финансовые цели", size=22, weight=ft.FontWeight.W_700),
-            ft.FilledButton(
-                "Новая цель", icon=ft.Icons.ADD,
-                on_click=lambda _: _goal_dialog(page, repos, rebuild),
-                style=ft.ButtonStyle(bgcolor=GREEN, color=ft.Colors.WHITE),
-            ),
-        ],
+    add_btn = ft.FilledButton(
+        "Новая цель", icon=ft.Icons.ADD,
+        on_click=lambda _: _goal_dialog(page, repos, rebuild),
+        style=ft.ButtonStyle(bgcolor=GREEN, color=ft.Colors.WHITE),
     )
+    header = screen_header(page, "Финансовые цели", rebuild, actions=[add_btn])
 
     if not goals:
         body: list[ft.Control] = [
             empty_state(
-                "Целей пока нет.\n"
-                "Нажмите «Новая цель», задайте сумму и следите за прогрессом.",
+                "Целей пока нет.\nЗадайте сумму и следите за прогрессом.",
                 ft.Icons.FLAG_OUTLINED,
+                cta_text="Создать первую цель",
+                on_cta=lambda: _goal_dialog(page, repos, rebuild),
             )
         ]
     else:
@@ -342,11 +389,4 @@ def build_goals(
         controls=[header, *body],
     )
 
-    return ft.Row(
-        expand=True,
-        controls=[
-            build_sidebar(page, "goals", navigate, on_theme_toggle),
-            ft.Container(content=content, expand=True, padding=24,
-                         bgcolor=page_bgcolor(page)),
-        ],
-    )
+    return ft.Container(content=content, expand=True, padding=24, bgcolor=page_bgcolor(page))
