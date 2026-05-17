@@ -12,8 +12,8 @@ try:
     _CRYPTO_AVAILABLE = True
 except Exception:  # pragma: no cover - platform-dependent (e.g. Android build without cryptography)
     InvalidTag = None  # type: ignore[assignment,misc]
-    AESGCM = None  # type: ignore[assignment]
-    Scrypt = None  # type: ignore[assignment]
+    AESGCM = None  # type: ignore[assignment,misc]
+    Scrypt = None  # type: ignore[assignment,misc]
     _CRYPTO_AVAILABLE = False
 
 MAGIC = b"PFM1"  # Personal Finance Manager v1
@@ -86,4 +86,22 @@ def encrypt_file_to_path(*, plaintext_path: Path, passphrase: str, out_path: Pat
     blob = encrypt_bytes(plaintext=plaintext, passphrase=passphrase)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(blob)
+
+
+def decrypt_file_to_bytes(*, encrypted_path: Path, passphrase: str) -> bytes:
+    """Decrypts an on-disk blob without ever writing plaintext to disk."""
+    return decrypt_bytes(blob=encrypted_path.read_bytes(), passphrase=passphrase)
+
+
+def encrypt_bytes_to_path(*, plaintext: bytes, passphrase: str, out_path: Path) -> None:
+    """Encrypts `plaintext` and writes the result atomically to `out_path`.
+
+    Writes to `<out_path>.tmp` first and then renames. A crash mid-write leaves
+    the previous good ciphertext intact.
+    """
+    blob = encrypt_bytes(plaintext=plaintext, passphrase=passphrase)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+    tmp.write_bytes(blob)
+    os.replace(tmp, out_path)
 

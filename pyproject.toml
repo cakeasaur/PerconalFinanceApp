@@ -1,6 +1,7 @@
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = ["prototypes"]
 
 [tool.ruff.lint]
 select = [
@@ -19,4 +20,17 @@ addopts = "-v --tb=short"
 filterwarnings = [
   "ignore::DeprecationWarning",
 ]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src/core", "src/infra"]
+strict_optional = true
+warn_redundant_casts = true
+warn_return_any = true
+no_implicit_optional = true
+check_untyped_defs = true
+# warn_unused_ignores отключён намеренно: в crypto.py стоят `# type: ignore[misc]`
+# для опционального импорта cryptography (fallback-ветка для Android-сборки).
+# src/ui_flet и main_flet.py пока вне strict-проверки: типы Flet
+# требуют отдельной зачистки (~70 ошибок).
 
