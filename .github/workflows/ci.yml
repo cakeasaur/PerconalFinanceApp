@@ -19,7 +19,7 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install dependencies (headless: no flet)
+      - name: "Install dependencies (headless: no flet)"
         run: |
           python -m pip install --upgrade pip
           # CI uses requirements/ci.txt (no flet — headless environment).
