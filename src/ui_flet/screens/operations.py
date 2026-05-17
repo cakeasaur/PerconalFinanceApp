@@ -2,31 +2,46 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Any
 
 import flet as ft
 
 from ...core.models import Transaction, TransactionType
 from ...core.reporting import totals_for_period
 from ...infra.db.connection import transaction as db_tx
-from ...ui.formatting import (
+from ...infra.logging import get_logger
+from ..components import (
+    card_container,
+    close_dialog,
+    confirm_dialog,
+    date_group_header,
+    empty_state,
+    metric_card,
+    open_dialog,
+    screen_header,
+    tx_row,
+)
+from ..formatting import (
     KIND_UI_TO_KIND,
     format_rub,
+    group_by_date,
     month_bounds_utc,
     month_title_ru,
     parse_money,
 )
-from ..components import (
-    build_sidebar,
-    card_container,
-    close_dialog,
-    empty_state,
-    metric_card,
-    open_dialog,
-    tx_row,
-)
 from ..state import Repos
-from ..theme import BLUE_SOFT, GREEN, GREEN_SOFT, PURPLE, RED, RED_SOFT, TEXT_MUTED, page_bgcolor
+from ..theme import (
+    BLUE_SOFT,
+    GREEN,
+    GREEN_SOFT,
+    PURPLE,
+    RED,
+    RED_SOFT,
+    TEXT_MUTED,
+    page_bgcolor,
+    show_snack,
+)
+
+log = get_logger("pfm.ui.operations")
 
 
 def _add_tx_dialog(
@@ -84,9 +99,14 @@ def _add_tx_dialog(
             with db_tx(repos.tx.conn):
                 repos.tx.create(t)
             close_dialog(page, dlg)
+            show_snack(page, "Операция добавлена")
             on_saved()
         except ValueError as exc:
             err_text.value = str(exc)
+            page.update()
+        except Exception as exc:
+            log.exception("transaction save failed")
+            err_text.value = f"Ошибка: {exc}"
             page.update()
 
     dlg = ft.AlertDialog(
@@ -117,13 +137,16 @@ def _add_tx_dialog(
     open_dialog(page, dlg)
 
 
+def open_add_tx_dialog(page: ft.Page, repos: Repos, rebuild: Callable[[], None]) -> None:
+    _add_tx_dialog(page, repos, rebuild)
+
+
 def build_operations(
     page: ft.Page,
     repos: Repos,
     state: dict,
     navigate: Callable[[str], None],
     rebuild: Callable[[], None],
-    on_theme_toggle: Callable[[Any], None],
 ) -> ft.Control:
     current_month: datetime = state.setdefault("ops_month", datetime.now(UTC))
     current_filter: str = state.setdefault("ops_filter", "all")
@@ -164,8 +187,16 @@ def build_operations(
         rebuild()
 
     def delete_tx(tx_id: int) -> None:
+        confirm_dialog(
+            page,
+            "Удалить операцию? Это действие необратимо.",
+            on_confirm=lambda: _do_delete(tx_id),
+        )
+
+    def _do_delete(tx_id: int) -> None:
         with db_tx(repos.tx.conn):
             repos.tx.delete(tx_id=tx_id)
+        show_snack(page, "Операция удалена", color=RED)
         rebuild()
 
     balance_color = GREEN if totals.balance_cents >= 0 else RED
@@ -173,34 +204,23 @@ def build_operations(
         current_filter, "Все"
     )
 
-    header = ft.Row(
-        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-        controls=[
-            ft.Text("Операции", size=22, weight=ft.FontWeight.W_700),
-            ft.Row(spacing=8, controls=[
-                ft.IconButton(ft.Icons.CHEVRON_LEFT, on_click=prev_month,
-                              icon_color=TEXT_MUTED),
-                ft.Text(month_title_ru(current_month), size=14,
-                        weight=ft.FontWeight.W_600),
-                ft.IconButton(ft.Icons.CHEVRON_RIGHT, on_click=next_month,
-                              icon_color=TEXT_MUTED),
-            ]),
-            ft.Row(spacing=10, controls=[
-                ft.Dropdown(
-                    value=filter_value,
-                    options=[ft.dropdown.Option(v) for v in ("Все", "Доходы", "Расходы")],
-                    on_select=on_filter_change,
-                    width=130, border_radius=10,
-                ),
-                ft.FilledButton(
-                    "Добавить",
-                    icon=ft.Icons.ADD,
-                    on_click=lambda _: _add_tx_dialog(page, repos, rebuild),
-                    style=ft.ButtonStyle(bgcolor=GREEN, color=ft.Colors.WHITE),
-                ),
-            ]),
-        ],
+    month_nav = ft.Row(spacing=4, controls=[
+        ft.IconButton(ft.Icons.CHEVRON_LEFT, on_click=prev_month, icon_color=TEXT_MUTED, icon_size=18),
+        ft.Text(month_title_ru(current_month), size=13, weight=ft.FontWeight.W_600),
+        ft.IconButton(ft.Icons.CHEVRON_RIGHT, on_click=next_month, icon_color=TEXT_MUTED, icon_size=18),
+    ])
+    filter_dd = ft.Dropdown(
+        value=filter_value,
+        options=[ft.dropdown.Option(v) for v in ("Все", "Доходы", "Расходы")],
+        on_select=on_filter_change,
+        width=120, border_radius=10, dense=True,
     )
+    add_btn = ft.FilledButton(
+        "Добавить", icon=ft.Icons.ADD,
+        on_click=lambda _: _add_tx_dialog(page, repos, rebuild),
+        style=ft.ButtonStyle(bgcolor=GREEN, color=ft.Colors.WHITE),
+    )
+    header = screen_header(page, "Операции", rebuild, actions=[month_nav, filter_dd, add_btn])
 
     metric_row = ft.Row(
         spacing=16,
@@ -216,11 +236,18 @@ def build_operations(
         ],
     )
 
+    cat_colors = {c.id: c.color for c in repos.cat.list_all()}
+
     def _tx_item(s) -> ft.Container:
         def _on_delete(_: ft.ControlEvent, _id: int = s.id) -> None:
             delete_tx(_id)
 
-        row = tx_row(s.transaction, categories.get(s.transaction.category_id))
+        cat_id = s.transaction.category_id
+        row = tx_row(
+            s.transaction,
+            categories.get(cat_id),
+            cat_colors.get(cat_id),
+        )
         row.content.controls.append(
             ft.IconButton(
                 ft.Icons.DELETE_OUTLINE, icon_color=TEXT_MUTED,
@@ -230,31 +257,58 @@ def build_operations(
         )
         return ft.Container(
             content=row,
-            border=ft.Border(bottom=ft.BorderSide(1, ft.Colors.with_opacity(0.06, TEXT_MUTED))),
+            border=ft.Border(bottom=ft.BorderSide(1, ft.Colors.with_opacity(0.05, TEXT_MUTED))),
         )
 
-    tx_list = card_container(
-        page,
-        ft.Column(
-            spacing=0,
-            controls=(
-                [empty_state("Операций за этот период нет.\nНажмите «Добавить», чтобы создать первую.")]
-                if not stored else
-                [_tx_item(s) for s in stored]
-            ),
-        ),
+    def _build_list(query: str = "") -> list[ft.Control]:
+        q = query.lower().strip()
+        filtered = [
+            s for s in stored
+            if not q
+            or q in (s.transaction.note or "").lower()
+            or q in (categories.get(s.transaction.category_id) or "").lower()
+        ]
+        if not filtered:
+            return [empty_state(
+                "Ничего не найдено." if q else "Операций за этот период нет.",
+                ft.Icons.RECEIPT_LONG_OUTLINED,
+                cta_text=None if q else "Добавить первую",
+                on_cta=None if q else lambda: _add_tx_dialog(page, repos, rebuild),
+            )]
+        items: list[ft.Control] = []
+        for label, group in group_by_date(filtered, lambda s: s.transaction.occurred_at):
+            items.append(date_group_header(label))
+            items.extend([_tx_item(s) for s in group])
+        return items
+
+    tx_list_col = ft.Column(spacing=0, controls=_build_list())
+
+    def on_search(e: ft.ControlEvent) -> None:
+        tx_list_col.controls = _build_list(e.control.value or "")
+        tx_list_col.update()
+
+    search_bar = ft.TextField(
+        hint_text="Поиск по заметке или категории...",
+        prefix_icon=ft.Icons.SEARCH,
+        on_change=on_search,
+        border_radius=12,
+        dense=True,
+        expand=True,
+    )
+
+    tx_list = card_container(page, tx_list_col)
+
+    page.floating_action_button = ft.FloatingActionButton(
+        icon=ft.Icons.ADD,
+        bgcolor=GREEN,
+        foreground_color=ft.Colors.WHITE,
+        on_click=lambda _: _add_tx_dialog(page, repos, rebuild),
+        mini=False,
     )
 
     content = ft.Column(
         spacing=16, expand=True, scroll=ft.ScrollMode.AUTO,
-        controls=[header, metric_row, tx_list],
+        controls=[header, metric_row, search_bar, tx_list],
     )
 
-    return ft.Row(
-        expand=True,
-        controls=[
-            build_sidebar(page, "operations", navigate, on_theme_toggle),
-            ft.Container(content=content, expand=True, padding=24,
-                         bgcolor=page_bgcolor(page)),
-        ],
-    )
+    return ft.Container(content=content, expand=True, padding=24, bgcolor=page_bgcolor(page))

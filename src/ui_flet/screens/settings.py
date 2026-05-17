@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
 
 import flet as ft
 
-from ..components import build_sidebar, close_dialog, open_dialog
-from ..theme import GREEN, GREEN_SOFT, RED, TEXT_MUTED, page_bgcolor
+from ...core.csv_io import export_csv, parse_csv
+from ...infra.db.connection import transaction as db_tx
+from ...infra.logging import get_logger
+from ..components import close_dialog, open_dialog, screen_header
+from ..state import Repos
+from ..theme import GREEN, GREEN_SOFT, RED, TEXT_MUTED, page_bgcolor, show_snack
 
 MIN_PASSPHRASE_LEN = 8  # зеркало из crypto.py — не импортируем чтобы не тянуть flet в тесты
+
+log = get_logger("pfm.ui.settings")
 
 
 def _section(title: str, controls: list[ft.Control]) -> ft.Column:
@@ -62,11 +67,7 @@ def _change_password_dialog(
             page.update()
             return
         close_dialog(page, dlg)
-        ok = ft.SnackBar(
-            content=ft.Text("Пароль изменён. Новый пароль применится при следующем запуске."),
-            bgcolor=GREEN,
-        )
-        page.open(ok)
+        show_snack(page, "Пароль изменён.")
 
     dlg = ft.AlertDialog(
         modal=True,
@@ -87,11 +88,65 @@ def _change_password_dialog(
     open_dialog(page, dlg)
 
 
+def _csv_export(page: ft.Page, repos: Repos) -> None:
+    try:
+        stored = repos.tx.list_all()
+        txs = [s.transaction for s in stored]
+        csv_bytes = export_csv(txs).encode("utf-8")
+        fp = ft.FilePicker()
+        page.overlay.append(fp)
+        page.update()
+        fp.save_file(
+            file_name="transactions.csv",
+            file_type=ft.FilePickerFileType.CUSTOM,
+            allowed_extensions=["csv"],
+            src_bytes=csv_bytes,
+        )
+        page.overlay.remove(fp)
+        show_snack(page, f"Экспортировано {len(txs)} операций")
+    except Exception:
+        log.exception("csv export failed")
+        show_snack(page, "Ошибка экспорта", color=RED)
+
+
+def _csv_import(page: ft.Page, repos: Repos, rebuild: Callable[[], None]) -> None:
+    try:
+        fp = ft.FilePicker()
+        page.overlay.append(fp)
+        page.update()
+        files = fp.pick_files(
+            dialog_title="Выбрать CSV файл с транзакциями",
+            file_type=ft.FilePickerFileType.CUSTOM,
+            allowed_extensions=["csv"],
+            with_data=True,
+        )
+        page.overlay.remove(fp)
+        if not files:
+            return
+        raw = files[0].bytes
+        if raw is None:
+            show_snack(page, "Не удалось прочитать файл", color=RED)
+            return
+        text = raw.decode("utf-8")
+        txs = parse_csv(text)
+        with db_tx(repos.tx.conn):
+            for tx in txs:
+                repos.tx.create(tx)
+        show_snack(page, f"Импортировано {len(txs)} операций")
+        rebuild()
+    except ValueError as exc:
+        show_snack(page, f"Ошибка формата: {exc}", color=RED)
+    except Exception:
+        log.exception("csv import failed")
+        show_snack(page, "Ошибка импорта", color=RED)
+
+
 def build_settings(
     page: ft.Page,
     navigate: Callable[[str], None],
-    on_theme_toggle: Callable[[Any], None],
+    rebuild: Callable[[], None],
     *,
+    repos: Repos | None = None,
     on_change_password: Callable[[str, str], str | None] | None,
 ) -> ft.Control:
     if on_change_password is not None:
@@ -213,20 +268,39 @@ def build_settings(
         ),
     ]
 
+    data_controls: list[ft.Control] = [
+        ft.Row(spacing=12, controls=[
+            ft.OutlinedButton(
+                "Экспорт CSV",
+                icon=ft.Icons.DOWNLOAD_OUTLINED,
+                on_click=lambda _: _csv_export(page, repos) if repos else None,
+                disabled=repos is None,
+            ),
+            ft.OutlinedButton(
+                "Импорт CSV",
+                icon=ft.Icons.UPLOAD_OUTLINED,
+                on_click=lambda _: _csv_import(page, repos, rebuild) if repos else None,
+                disabled=repos is None,
+            ),
+        ]),
+        ft.Text(
+            "Экспорт: сохраняет все транзакции в CSV-файл.\n"
+            "Импорт: добавляет транзакции из CSV (дубли не проверяются).",
+            color=TEXT_MUTED, size=12,
+        ),
+    ]
+
+    header = screen_header(page, "Настройки", rebuild)
+
     content = ft.Column(
         spacing=28, expand=True, scroll=ft.ScrollMode.AUTO,
         controls=[
-            ft.Text("Настройки", size=22, weight=ft.FontWeight.W_700),
+            header,
             _section("Безопасность", security_controls),
+            _section("Данные", data_controls),
             _section("О приложении", about_controls),
             _section("Разработчик", author_controls),
         ],
     )
 
-    return ft.Row(
-        expand=True,
-        controls=[
-            build_sidebar(page, "settings", navigate, on_theme_toggle),
-            ft.Container(content=content, expand=True, padding=24, bgcolor=page_bgcolor(page)),
-        ],
-    )
+    return ft.Container(content=content, expand=True, padding=24, bgcolor=page_bgcolor(page))

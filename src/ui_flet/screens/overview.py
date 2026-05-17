@@ -1,24 +1,18 @@
 from __future__ import annotations
 
 import calendar
-import io
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from typing import Any
 
 import flet as ft
-import matplotlib
-import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
-
-matplotlib.use("Agg")
 
 from ...core.reporting import expense_by_category, expense_by_day, income_by_day, totals_for_period
-from ...ui.formatting import format_rub, month_bounds_utc
-from ..components import build_sidebar, card_container, tx_row
+from ..components import card_container, metric_card, screen_header, tx_row
+from ..formatting import format_rub, month_bounds_utc
 from ..state import Repos
 from ..theme import (
     BLUE_SOFT,
+    CHART_PALETTE,
     GREEN,
     GREEN_SOFT,
     PURPLE,
@@ -42,7 +36,7 @@ _GOAL_ICONS = {
     "телефон": ft.Icons.PHONE_ANDROID, "отпуск": ft.Icons.BEACH_ACCESS,
 }
 
-_CAT_COLORS = [PURPLE, "#3B82F6", "#F59E0B", "#EC4899", "#14B8A6"]
+_CAT_COLORS = CHART_PALETTE
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -67,121 +61,143 @@ def _days_word(n: int) -> str:
     return "дней"
 
 
-def _smooth_gaussian(arr: list[float], sigma: float = 2.5) -> list[float]:
-    import numpy as np
-    a = np.array(arr, dtype=float)
-    if a.max() == 0:
-        return arr
-    radius = max(1, int(3 * sigma))
-    x = np.arange(-radius, radius + 1, dtype=float)
-    kernel = np.exp(-x * x / (2 * sigma * sigma))
-    kernel /= kernel.sum()
-    padded = np.concatenate([np.zeros(radius), a, np.zeros(radius)])
-    return np.convolve(padded, kernel, mode="valid").tolist()
-
-
 # ── chart ─────────────────────────────────────────────────────────────────────
 
+def _fmt_short(cents: int) -> str:
+    v = cents / 100
+    if v >= 1_000_000:
+        s = f"{v/1_000_000:.1f}".rstrip("0").rstrip(".")
+        return f"{s}М"
+    if v >= 1_000:
+        n = v / 1_000
+        return f"{int(n)}К" if n == int(n) else f"{n:.1f}К"
+    return f"{int(v)}"
+
+
+def _mini_bars(
+    by_day: dict[int, int],
+    days: list[int],
+    color: str,
+    bar_w: int,
+    bar_area_h: int,
+    x_ticks: set[int],
+    mon: str,
+    fg: str,
+) -> list[ft.Control]:
+    """Строит список Column для одной серии (доходы ИЛИ расходы).
+
+    Каждый Column содержит: пустой спейсер + столбик + метку дня.
+    Все Column одинаковой высоты → Row с alignment=START выглядит корректно.
+    """
+    max_val = max((by_day.get(d, 0) for d in days), default=0)
+    cols: list[ft.Control] = []
+    for d in days:
+        cents = by_day.get(d, 0)
+        ratio = cents / max_val if max_val > 0 else 0
+        bar_h = max(2, int(ratio * bar_area_h)) if cents > 0 else 0
+        spacer_h = bar_area_h - bar_h
+        label = f"{d} {mon}" if d in x_ticks else ""
+        tooltip = f"{d} {mon}: {_fmt_short(cents)} ₽" if cents > 0 else ""
+        cols.append(
+            ft.Column(
+                spacing=0,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                tooltip=tooltip,
+                controls=[
+                    ft.Container(height=spacer_h),
+                    ft.Container(
+                        width=bar_w, height=bar_h,
+                        bgcolor=ft.Colors.with_opacity(0.85, color),
+                        border_radius=ft.BorderRadius(
+                            top_left=2, top_right=2,
+                            bottom_left=0, bottom_right=0,
+                        ),
+                    ),
+                    ft.Container(height=4),
+                    ft.Text(label, size=8, color=fg,
+                            text_align=ft.TextAlign.CENTER, width=bar_w + 6),
+                ],
+            )
+        )
+    return cols
+
+
 def _dynamics_chart(
-    by_day_income: dict,
-    by_day_expense: dict,
+    by_day_income: dict[int, int],
+    by_day_expense: dict[int, int],
     days_in_month: int,
     month_num: int,
     is_dark: bool,
-) -> ft.Image:
-    plt.close("all")
-    bg       = "#1E293B" if is_dark else "#FFFFFF"
-    fg       = "#CBD5E1" if is_dark else "#64748B"
-    grid_col = "#334155" if is_dark else "#F1F5F9"
-    mon      = _MONTH_SHORT.get(month_num, "")
-    days     = list(range(1, days_in_month + 1))
+) -> ft.Control:
+    fg = "#94A3B8" if is_dark else TEXT_MUTED
+    mon = _MONTH_SHORT.get(month_num, "")
+    days = list(range(1, days_in_month + 1))
+    bar_area_h = 70
+    bar_w = max(5, min(14, 560 // days_in_month))
+    spacing = max(1, bar_w // 3)
+    x_ticks = {1, 8, 15, 22, days_in_month}
 
-    smooth_inc = _smooth_gaussian([by_day_income.get(d, 0) / 100 for d in days])
-    smooth_exp = _smooth_gaussian([by_day_expense.get(d, 0) / 100 for d in days])
+    max_inc = max((by_day_income.get(d, 0) for d in days), default=1)
+    max_exp = max((by_day_expense.get(d, 0) for d in days), default=1)
 
-    marker_days = list(range(1, days_in_month + 1, 3))
-    if marker_days[-1] != days_in_month:
-        marker_days.append(days_in_month)
+    def _series_row(
+        by_day: dict[int, int],
+        color: str,
+        label: str,
+        max_val: int,
+        show_x: bool,
+    ) -> ft.Control:
+        cols = _mini_bars(
+            by_day, days, color, bar_w, bar_area_h,
+            x_ticks if show_x else set(), mon, fg if show_x else ft.Colors.TRANSPARENT,
+        )
+        max_label = _fmt_short(max_val) if max_val > 0 else "0"
+        x_label_h = 14
+        total_h = bar_area_h + x_label_h
+        y_axis = ft.Container(
+            width=44, height=total_h,
+            content=ft.Stack([
+                ft.Container(
+                    top=0, right=0,
+                    content=ft.Text(
+                        max_label, size=8, color=fg,
+                        no_wrap=True, text_align=ft.TextAlign.RIGHT,
+                    ),
+                ),
+                ft.Container(
+                    top=bar_area_h - 10, right=0,
+                    content=ft.Text(
+                        "0", size=8, color=fg,
+                        text_align=ft.TextAlign.RIGHT,
+                    ),
+                ),
+            ]),
+        )
+        return ft.Row(
+            spacing=0,
+            vertical_alignment=ft.CrossAxisAlignment.START,
+            controls=[
+                y_axis,
+                ft.Container(width=4),
+                ft.Row(
+                    spacing=spacing,
+                    vertical_alignment=ft.CrossAxisAlignment.START,
+                    controls=cols,
+                    expand=True,
+                ),
+            ],
+        )
 
-    fig, ax = plt.subplots(figsize=(10, 3.0))
-    fig.patch.set_facecolor(bg)
-    ax.set_facecolor(bg)
-
-    ax.fill_between(days, smooth_inc, alpha=0.13, color=GREEN, zorder=1)
-    ax.fill_between(days, smooth_exp, alpha=0.13, color=RED, zorder=1)
-    ax.plot(days, smooth_inc, color=GREEN, linewidth=2.2, zorder=3)
-    ax.plot(days, smooth_exp, color=RED, linewidth=2.2, zorder=3)
-
-    for d in marker_days:
-        idx = d - 1
-        ax.plot(d, smooth_inc[idx], "o", color=GREEN, markersize=5, markeredgewidth=0, zorder=4)
-        ax.plot(d, smooth_exp[idx], "o", color=RED, markersize=5, markeredgewidth=0, zorder=4)
-
-    ticks = [1, 8, 15, 22, days_in_month]
-    ax.set_xticks(ticks)
-    ax.set_xticklabels([f"{d} {mon}" for d in ticks], color=fg, fontsize=8.5)
-    ax.set_xlim(0.5, days_in_month + 0.5)
-
-    def _fmt_y(val: float, _pos: int) -> str:
-        if val >= 1_000_000:
-            return f"{val/1_000_000:.1f}М".rstrip("0").rstrip(".")
-        if val >= 1_000:
-            n = val / 1_000
-            return f"{int(n)}К" if n == int(n) else f"{n:.1f}К"
-        return str(int(val)) if val > 0 else "0"
-
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(_fmt_y))
-    ax.tick_params(axis="y", colors=fg, labelsize=8.5, length=0)
-    ax.tick_params(axis="x", colors=fg, length=0)
-    ax.set_ylim(bottom=0)
-    ax.yaxis.grid(True, color=grid_col, linewidth=0.8)
-    ax.set_axisbelow(True)
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-    ax.spines["bottom"].set_visible(True)
-    ax.spines["bottom"].set_color("#334155" if is_dark else "#E2E8F0")
-    ax.spines["bottom"].set_linewidth(0.8)
-
-    fig.tight_layout(pad=0.5)
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight",
-                facecolor=fig.get_facecolor())
-    plt.close(fig)
-    buf.seek(0)
-    return ft.Image(src=buf.read(), fit=ft.BoxFit.CONTAIN, expand=True)
+    return ft.Column(
+        spacing=4,
+        controls=[
+            _series_row(by_day_income, GREEN, "Доходы", max_inc, show_x=False),
+            _series_row(by_day_expense, RED, "Расходы", max_exp, show_x=True),
+        ],
+    )
 
 
 # ── sub-widgets ───────────────────────────────────────────────────────────────
-
-def _metric_card(
-    page: ft.Page,
-    title: str,
-    value: str,
-    delta: str,
-    delta_color: str,
-    icon: str,
-    icon_bg: str,
-) -> ft.Container:
-    controls: list[ft.Control] = [
-        ft.Row(
-            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-            controls=[
-                ft.Text(title, color=TEXT_MUTED, size=13),
-                ft.Container(
-                    bgcolor=icon_bg, border_radius=20, width=32, height=32,
-                    alignment=ft.Alignment.CENTER,
-                    content=ft.Icon(icon, color=delta_color, size=18),
-                ),
-            ],
-        ),
-        ft.Text(value, size=22, weight=ft.FontWeight.W_700),
-    ]
-    if delta:
-        controls.append(
-            ft.Text(delta, color=delta_color, size=12, weight=ft.FontWeight.W_500)
-        )
-    return card_container(page, ft.Column(spacing=8, controls=controls))
-
 
 def _cat_row(
     name: str,
@@ -238,8 +254,9 @@ def _goal_icon(name: str) -> str:
 def build_overview(
     page: ft.Page,
     repos: Repos,
+    app_state: dict,
     navigate: Callable[[str], None],
-    on_theme_toggle: Callable[[Any], None],
+    rebuild: Callable[[], None],
 ) -> ft.Control:
     now = datetime.now(UTC)
     start, end = month_bounds_utc(now)
@@ -277,46 +294,33 @@ def build_overview(
     mon = _MONTH_SHORT[now.month]
     date_range = f"{start.day}–{end.day} {mon} {now.year}"
 
-    header = ft.Row(
-        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-        controls=[
-            ft.Text("Главная", size=22, weight=ft.FontWeight.W_700),
-            ft.Row(spacing=8, controls=[
-                ft.Container(
-                    bgcolor=card_bgcolor(page), border_radius=8,
-                    padding=ft.Padding(12, 6, 12, 6),
-                    content=ft.Row(spacing=6, controls=[
-                        ft.Text(date_range, size=12, color=TEXT_MUTED),
-                        ft.Icon(ft.Icons.CALENDAR_MONTH_OUTLINED, size=14, color=TEXT_MUTED),
-                    ]),
-                ),
-                ft.Container(
-                    bgcolor=card_bgcolor(page), border_radius=8,
-                    width=34, height=34,
-                    alignment=ft.Alignment.CENTER,
-                    content=ft.Icon(ft.Icons.TUNE, size=16, color=TEXT_MUTED),
-                ),
-            ]),
-        ],
+    date_chip = ft.Container(
+        bgcolor=card_bgcolor(page), border_radius=8,
+        padding=ft.Padding(12, 6, 12, 6),
+        content=ft.Row(spacing=6, controls=[
+            ft.Text(date_range, size=12, color=TEXT_MUTED),
+            ft.Icon(ft.Icons.CALENDAR_MONTH_OUTLINED, size=14, color=TEXT_MUTED),
+        ]),
     )
+    header = screen_header(page, "Главная", rebuild, actions=[date_chip])
 
     # ── metric row ────────────────────────────────────────────────────────────
     metric_row = ft.Row(
         spacing=16,
         controls=[
-            _metric_card(page, "Баланс",
+            metric_card(page, "Баланс",
                          f"{format_rub(totals.balance_cents)} ₽",
                          bal_delta, balance_color,
                          ft.Icons.ACCOUNT_BALANCE_WALLET, GREEN_SOFT),
-            _metric_card(page, "Доходы",
+            metric_card(page, "Доходы",
                          f"{format_rub(totals.income_cents)} ₽",
                          inc_delta, inc_color,
                          ft.Icons.TRENDING_UP, GREEN_SOFT),
-            _metric_card(page, "Расходы",
+            metric_card(page, "Расходы",
                          f"{format_rub(totals.expense_cents)} ₽",
                          exp_delta, exp_color,
                          ft.Icons.TRENDING_DOWN, RED_SOFT),
-            _metric_card(page, "До конца месяца",
+            metric_card(page, "До конца месяца",
                          f"{days_left} {_days_word(days_left)}",
                          f"из {days_in_month} дней в месяце", "#3B82F6",
                          ft.Icons.CALENDAR_TODAY, BLUE_SOFT),
@@ -345,11 +349,7 @@ def build_overview(
                         ]),
                     ],
                 ),
-                ft.Container(
-                    content=_dynamics_chart(by_day_inc, by_day_exp,
-                                            days_in_month, now.month, is_dark),
-                    height=200, expand=True,
-                ),
+                _dynamics_chart(by_day_inc, by_day_exp, days_in_month, now.month, is_dark),
             ],
         ),
     )
@@ -495,11 +495,4 @@ def build_overview(
         ],
     )
 
-    return ft.Row(
-        expand=True,
-        controls=[
-            build_sidebar(page, "overview", navigate, on_theme_toggle),
-            ft.Container(content=content, expand=True, padding=24,
-                         bgcolor=page_bgcolor(page)),
-        ],
-    )
+    return ft.Container(content=content, expand=True, padding=24, bgcolor=page_bgcolor(page))
